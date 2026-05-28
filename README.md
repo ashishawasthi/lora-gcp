@@ -7,6 +7,7 @@ LoRA / QLoRA fine-tuning experiments, sized to run on free / cheap cloud GPUs (C
 | Notebook | Base model | Dataset | GPU | Notes |
 | --- | --- | --- | --- | --- |
 | [qlora_t4_llama.ipynb](qlora_t4_llama.ipynb) | `unsloth/Llama-3.2-3B-Instruct` (4-bit) | `yahma/alpaca-cleaned` (1k slice, wrapped as `{"response": ...}` JSON) | Colab T4 (16 GB) | QLoRA run with Unsloth + TRL `SFTTrainer` that teaches the model to emit JSON. ~15 min, trains ~0.75% of params, ~109 MB adapter. BEFORE = prose, AFTER = `{"response": "..."}`. |
+| [qlora_t4_gemma.ipynb](qlora_t4_gemma.ipynb) | `unsloth/gemma-3-4b-it` (4-bit) | `yahma/alpaca-cleaned` (1k slice, wrapped as `{"response": ...}` JSON) | Colab T4 (16 GB) | Same JSON-output task as the Llama notebook, on Gemma instead. Swap `model_name` to a `unsloth/gemma-4-*-it` repo when Gemma 4 ships on Unsloth. |
 
 More notebooks (different base models, datasets, ranks, target modules) will be added here as experiments accumulate.
 
