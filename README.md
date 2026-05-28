@@ -12,6 +12,8 @@ LoRA / QLoRA fine-tuning experiments, sized to run on free / cheap cloud GPUs (C
 
 More notebooks (different base models, datasets, ranks, target modules) will be added here as experiments accumulate.
 
+See [gemma4-oom-mitigations.md](gemma4-oom-mitigations.md) for a breakdown of every memory-saving lever pulled in the Gemma 4 notebook to fit it on a free T4 (memory saved per measure + tradeoffs).
+
 ## Running
 
 Each notebook is self-contained. Open in Colab, set `Runtime → Change runtime type → T4 GPU`, and run top-to-bottom. The first cell installs its own dependencies.
