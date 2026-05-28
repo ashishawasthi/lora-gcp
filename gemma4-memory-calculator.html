@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gemma 4 Memory Calculator</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #181b22;
+    --panel-2: #1f232c;
+    --border: #2a2f3a;
+    --text: #e5e7eb;
+    --muted: #9ca3af;
+    --accent: #60a5fa;
+    --good: #34d399;
+    --bad: #f87171;
+    --warn: #fbbf24;
+    --bar: #3b82f6;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+  }
+  header {
+    padding: 24px 32px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0 0 6px; font-size: 24px; }
+  header p { margin: 0; color: var(--muted); font-size: 14px; }
+  main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 24px;
+    padding: 24px 32px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section h2 {
+    font-size: 16px;
+    margin: 0 0 12px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  fieldset {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin: 0 0 14px;
+  }
+  legend {
+    padding: 0 8px;
+    font-weight: 600;
+    font-size: 14px;
+  }
+  fieldset label {
+    display: block;
+    padding: 4px 0;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  fieldset label input { margin-right: 8px; }
+  .tradeoff {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed var(--border);
+    font-style: italic;
+  }
+  .range-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 4px 0;
+  }
+  .range-row input[type=range] { flex: 1; }
+  .range-row output {
+    min-width: 50px;
+    font-family: ui-monospace, monospace;
+    font-size: 14px;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 14px;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left;
+    padding: 8px 6px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; }
+  td.size { text-align: right; font-family: ui-monospace, monospace; }
+  .bar {
+    height: 6px;
+    background: var(--bar);
+    border-radius: 3px;
+    display: inline-block;
+    vertical-align: middle;
+  }
+  .total {
+    margin-top: 12px;
+    padding: 12px;
+    background: var(--panel-2);
+    border-radius: 6px;
+    text-align: center;
+    font-size: 18px;
+  }
+  .total b { color: var(--accent); font-family: ui-monospace, monospace; }
+  .gpu-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 14px; }
+  .gpu-name { flex: 1; }
+  .gpu-status { font-weight: 600; font-family: ui-monospace, monospace; }
+  .fit { color: var(--good); }
+  .tight { color: var(--warn); }
+  .nofit { color: var(--bad); }
+  .gpu-bar {
+    flex: 2;
+    height: 8px;
+    background: var(--panel-2);
+    border-radius: 4px;
+    overflow: hidden;
+    position: relative;
+  }
+  .gpu-bar-fill {
+    height: 100%;
+    background: var(--bar);
+    transition: width 0.2s, background 0.2s;
+  }
+  input[disabled] + span, label.disabled { opacity: 0.4; }
+  .note {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 8px;
+  }
+  code {
+    background: var(--panel-2);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Gemma 4 Memory Calculator</h1>
+  <p>Pick the memory-saving levers; see the estimated peak GPU memory and which GPUs fit. Estimates calibrated against this repo's <a href="gemma4-oom-mitigations.md" style="color:var(--accent);">empirical mitigations doc</a> (T4 OOM on static, L4 OOM on the bf16 cross-entropy logits, A100 fits with headroom).</p>
+</header>
+
+<main>
+  <section class="options">
+    <h2>Configuration</h2>
+
+    <fieldset>
+      <legend>Model variant</legend>
+      <label><input type="radio" name="model" value="E2B"> <b>gemma-4-E2B-it</b> &mdash; ~2B effective, ~3.5 GB PLE</label>
+      <label><input type="radio" name="model" value="E4B" checked> <b>gemma-4-E4B-it</b> &mdash; ~4.5B effective, ~7 GB PLE</label>
+      <div class="tradeoff">PLE (Per-Layer Embeddings) cannot be 4-bit quantized &mdash; it stays fp16 and dominates static footprint. E2B saves ~3.5 GB on this line alone, at the cost of model capability.</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Weight quantization</legend>
+      <label><input type="radio" name="quant" value="fp16"> fp16 (full precision linears)</label>
+      <label><input type="radio" name="quant" value="int8"> 8-bit (LLM.int8 / bnb int8)</label>
+      <label><input type="radio" name="quant" value="nf4" checked> 4-bit NF4 (QLoRA standard)</label>
+      <div class="tradeoff">4-bit cuts the linear-weights column ~4&times; vs fp16. Adds a bnb dequant kernel per forward pass (~800 MB transient scratch on E4B). Negligible quality loss for SFT tasks.</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Training mode</legend>
+      <label><input type="radio" name="trainMode" value="full"> Full fine-tune (all params)</label>
+      <label><input type="radio" name="trainMode" value="lora" checked> LoRA adapters only</label>
+      <div class="tradeoff">Full FT trains all ~8B params &mdash; massive gradients and optimizer state (30-50 GB just for that). LoRA trains 0.1-1% of params. Practically required to fit Gemma 4 on a single GPU.</div>
+    </fieldset>
+
+    <fieldset id="loraGroup">
+      <legend>LoRA rank (<span id="trainableOut">36.7M</span> trainable params)</legend>
+      <div class="range-row">
+        <input type="range" min="4" max="64" step="4" value="16" id="loraRank">
+        <output for="loraRank" id="loraRankOut">r = 16</output>
+      </div>
+      <div class="tradeoff">Higher rank = more capacity &amp; more adapter memory. r=4 to r=64 spans ~10&times; trainable param count. Negligible memory impact vs base model.</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Optimizer (controls optimizer state size)</legend>
+      <label><input type="radio" name="opt" value="fp32_adamw"> AdamW fp32 &mdash; baseline (~12 bytes/param)</label>
+      <label><input type="radio" name="opt" value="adamw_8bit" checked> adamw_8bit &mdash; 8-bit m+v, fp32 master on GPU (~6 bytes/param)</label>
+      <label><input type="radio" name="opt" value="paged_adamw_8bit"> paged_adamw_8bit &mdash; master weights paged to CPU (~4 bytes/param)</label>
+      <div class="tradeoff">paged variant trades ~10-15% wall-clock per step for ~150 MB savings. Only meaningful when VRAM is genuinely tight.</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Batching (grouped: bs &amp; grad_accum keep effective batch = 8)</legend>
+      <div class="range-row">
+        <label style="min-width: 220px;">per_device_batch_size</label>
+        <input type="range" min="1" max="8" step="1" value="2" id="batchSize">
+        <output for="batchSize" id="batchSizeOut">2</output>
+      </div>
+      <div class="range-row">
+        <label style="min-width: 220px;">gradient_accumulation_steps</label>
+        <output id="gradAccumOut" style="text-align:left; color: var(--muted);">4 (auto-derived)</output>
+      </div>
+      <div class="tradeoff">Activation memory scales linearly with batch size. grad_accum auto-adjusts to keep effective batch = 8 (comparable training dynamics).</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Sequence length</legend>
+      <div class="range-row">
+        <input type="range" min="256" max="4096" step="256" value="1024" id="seqLength">
+        <output for="seqLength" id="seqLengthOut">1024</output>
+      </div>
+      <div class="tradeoff">Activations scale linearly with sequence length. >1024 truncates a few alpaca outliers; >2048 is mostly waste for instruction SFT.</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Other memory levers</legend>
+      <label><input type="checkbox" id="gradCheckpoint" checked> Gradient checkpointing (<code>use_gradient_checkpointing="unsloth"</code>)</label>
+      <div class="tradeoff">Saves 1-2 GB on activations by recomputing during backward. ~30% slower per step. Almost always worth keeping on.</div>
+
+      <label style="margin-top:10px;"><input type="checkbox" id="lengthSort" checked> Pre-sort dataset by length</label>
+      <div class="tradeoff">Eliminates ~2-3 GB worst-case spike from long-outlier batches (e.g. alpaca's 1500+ token rows). Without this, OOMs hit mid-training instead of step 0.</div>
+
+      <label style="margin-top:10px;"><input type="checkbox" id="expandableSeg" checked> <code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code></label>
+      <div class="tradeoff">Cuts allocator fragmentation by 300-700 MB. Set before <code>import torch</code>. Almost free; keep on.</div>
+    </fieldset>
+  </section>
+
+  <section class="output">
+    <h2>Memory breakdown</h2>
+    <div class="panel">
+      <table id="breakdown">
+        <thead>
+          <tr><th>Component</th><th style="text-align:right">Size</th><th style="width:35%">Share</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div class="total">Estimated peak: <b id="totalMem">&mdash;</b></div>
+    </div>
+
+    <h2>GPU fit</h2>
+    <div class="panel">
+      <div id="gpuFit"></div>
+      <p class="note">"Fits with X GB headroom" = the GPU has X GB free after peak load. <b>&lt;1 GB headroom is unsafe</b> &mdash; allocator fragmentation, variable-length spikes, or kernel JIT can tip it into OOM.</p>
+    </div>
+
+    <h2>Source &amp; assumptions</h2>
+    <div class="panel" style="font-size:12px; color:var(--muted);">
+      <p style="margin-top:0">Formulas calibrated empirically against the OOM events in the <a href="gemma4-oom-mitigations.md" style="color:var(--accent);">OOM mitigations doc</a> (T4 ~10 GB static, L4 ~22 GB at step 2, A100 ~17 GB at step 0). Naive textbook estimates predict ~13 GB, but real measurements show 17-22 GB. Why the gap:</p>
+      <ul style="margin-bottom:0">
+        <li>NF4: 0.55 bytes/param (4-bit code + per-block fp16 scale)</li>
+        <li>Embeddings: vocab&nbsp;&times;&nbsp;hidden&nbsp;&times;&nbsp;2 bytes (no quantization; PLE adds ~3.5B more fp16 params on E4B)</li>
+        <li>LoRA: r&nbsp;&times;&nbsp;(in+out) per projection &times; layers, fp16</li>
+        <li>adamw_8bit: ~6 bytes/trainable param (m+v 8-bit + fp32 master)</li>
+        <li>paged_adamw_8bit: ~4 bytes/trainable param (master paged to CPU)</li>
+        <li><b>Activations: bs &times; seq &times; (hidden + mlp_intermediate) &times; layers &times; 6, &div; 4 under Unsloth checkpointing</b> &mdash; Unsloth's checkpointing keeps attn-block intermediates, so the reduction is ~4&times; not 8&times;. Per-layer holds residuals, layer norms, Q/K/V, attention scores, MLP gate/up/down intermediates.</li>
+        <li><b>bnb dequant scratch (accumulated): per-tile size &times; 3</b> &mdash; multiple layers' dequant'd fp16 tiles coexist in PyTorch's caching allocator. Sequence-independent, so dropping seq does NOT help this.</li>
+        <li><b>Cross-entropy logits + backward: bs &times; seq &times; vocab &times; 2 &times; 3</b> &mdash; Gemma 4's 262k vocab makes this dominant on L4. The &times;3 covers forward logits + grad-w.r.t.-logits + log_softmax intermediates. This is the line that pushes L4 over 22 GB even with sort + checkpointing on.</li>
+        <li><b>cuBLAS + autocast workspaces: ~2.5 GB</b> &mdash; the LM head matmul over 262k vocab needs larger cuBLAS scratch than typical hidden-to-hidden ops; bf16 autocast also keeps brief fp32 intermediates for stability (softmax, layer norm).</li>
+        <li><b>Framework overhead: 1.5 GB</b> with <code>expandable_segments</code>, 2.5 GB without &mdash; allocator fragmentation, PEFT/Unsloth wrapper allocations, autograd graph storage.</li>
+      </ul>
+    </div>
+  </section>
+</main>
+
+<script>
+'use strict';
+
+const MODELS = {
+  E2B: { name: "gemma-4-E2B-it", linearParams: 2.0e9, embedFp16Bytes: 3.5e9,
+         layers: 26, hidden: 2304, mlpIntermediate: 9216, bnbDequant: 500e6, vocab: 262144 },
+  E4B: { name: "gemma-4-E4B-it", linearParams: 4.5e9, embedFp16Bytes: 7.0e9,
+         layers: 42, hidden: 2560, mlpIntermediate: 10240, bnbDequant: 800e6, vocab: 262144 },
+};
+
+const GPUS = [
+  { name: "Colab T4 (16 GB)",     vramGB: 14.56 },
+  { name: "Colab L4 (22 GB)",     vramGB: 21.50 },
+  { name: "Colab L4 (24 GB)",     vramGB: 23.50 },
+  { name: "RTX 4090 (24 GB)",     vramGB: 23.50 },
+  { name: "A100 (40 GB)",         vramGB: 39.50 },
+  { name: "A100 (80 GB)",         vramGB: 79.50 },
+  { name: "H100 (80 GB)",         vramGB: 79.50 },
+];
+
+const QUANT_BYTES = { fp16: 2.0, int8: 1.0, nf4: 0.55 };
+const OPT_BYTES   = { fp32_adamw: 12, adamw_8bit: 6, paged_adamw_8bit: 4 };
+const GB = 1024 ** 3;
+
+function loraParamCount(model, rank) {
+  // 4 attention projections (q,k,v,o) with same in/out hidden dims,
+  // 2 MLP projections (gate, up) hidden -> intermediate,
+  // 1 MLP projection (down) intermediate -> hidden
+  const perLayer =
+    4 * rank * (model.hidden + model.hidden) +
+    2 * rank * (model.hidden + model.mlpIntermediate) +
+    1 * rank * (model.mlpIntermediate + model.hidden);
+  return model.layers * perLayer;
+}
+
+function getOpts() {
+  return {
+    model: document.querySelector('input[name=model]:checked').value,
+    quant: document.querySelector('input[name=quant]:checked').value,
+    trainMode: document.querySelector('input[name=trainMode]:checked').value,
+    optimizer: document.querySelector('input[name=opt]:checked').value,
+    loraRank: +document.getElementById('loraRank').value,
+    batchSize: +document.getElementById('batchSize').value,
+    seqLength: +document.getElementById('seqLength').value,
+    gradCheckpoint: document.getElementById('gradCheckpoint').checked,
+    lengthSort: document.getElementById('lengthSort').checked,
+    expandableSeg: document.getElementById('expandableSeg').checked,
+  };
+}
+
+function calculate(o) {
+  const m = MODELS[o.model];
+  const components = {};
+
+  // 1. Base model weights (linears, quantized per choice)
+  components['Linear weights ('+o.quant+')'] = m.linearParams * QUANT_BYTES[o.quant];
+
+  // 2. Embeddings + PLE (always fp16)
+  components['Embeddings + PLE (fp16, not quantizable)'] = m.embedFp16Bytes;
+
+  // 3. LoRA or full-FT branches
+  let trainableParams;
+  if (o.trainMode === 'lora') {
+    trainableParams = loraParamCount(m, o.loraRank);
+    components['LoRA adapters (fp16)'] = trainableParams * 2;
+  } else {
+    trainableParams = m.linearParams;
+    components['LoRA adapters (fp16)'] = 0;
+  }
+
+  // 4. Gradients (fp16, only for trainable params)
+  components['Gradients (fp16)'] = trainableParams * 2;
+
+  // 5. Optimizer state
+  components['Optimizer state ('+o.optimizer+')'] = trainableParams * OPT_BYTES[o.optimizer];
+
+  // 6. Activations (peak during forward + backward)
+  // Empirical: per layer holds residuals, layer norms, attn Q/K/V, attn scores,
+  // MLP gate/up/down intermediates. Factor 6 over (hidden + mlp_intermediate)
+  // matches what we observe on real Gemma 4 runs.
+  // Unsloth gradient checkpointing reduces by ~4x (not 8x as previously assumed -
+  // it keeps attention-block intermediates, not just layer boundaries).
+  const rawActivation = o.batchSize * o.seqLength * (m.hidden + m.mlpIntermediate) * m.layers * 6;
+  let activation = o.gradCheckpoint ? rawActivation / 4 : rawActivation;
+  // Length-sort eliminates the worst-case spike. Without it, peak is ~1.6x larger.
+  const spikeFactor = o.lengthSort ? 1.0 : 1.6;
+  components['Activations (peak)'] = activation * spikeFactor;
+
+  // 7. bnb dequant transient scratch (sequence-independent, NOT helped by seq reduction)
+  // Multiple layers' dequant'd fp16 tiles coexist in PyTorch's caching allocator
+  // - peak is ~3x the per-tile size empirically.
+  components['bnb dequant scratch (accumulated)'] = o.quant === 'nf4' ? m.bnbDequant * 3 : 0;
+
+  // 7b. Cross-entropy logits + backward (the L4 killer)
+  // Forward holds logits (bs * seq * vocab * 2 bytes bf16). Backward also
+  // holds grad-w.r.t.-logits (same size) + log_softmax intermediates +
+  // softmax probabilities. Total ~3x logits size during backward.
+  // Gemma 4's 262k vocab makes this dominant on L4-class GPUs.
+  components['Cross-entropy logits + backward (bf16)'] = o.batchSize * o.seqLength * m.vocab * 2 * 3;
+
+  // 8. cuBLAS workspaces + bf16 autocast overhead
+  // LM head matmul over 262k vocab needs larger cuBLAS scratch than typical
+  // hidden-to-hidden matmuls. bf16 autocast also keeps brief fp32 intermediates
+  // for stability (softmax, layer norm, residual adds).
+  components['cuBLAS + autocast workspaces'] = 2.5 * GB;
+
+  // 9. Allocator fragmentation + framework overhead
+  // expandable_segments helps but doesn't eliminate fragmentation;
+  // PyTorch/Unsloth/PEFT wrappers also hold misc small allocations.
+  components['Framework overhead'] = o.expandableSeg ? 1.5 * GB : 2.5 * GB;
+
+  const total = Object.values(components).reduce((a, b) => a + b, 0);
+  return { components, total, trainableParams };
+}
+
+function fmtBytes(b) {
+  if (b === 0) return '0';
+  if (b < 1e6) return (b / 1024).toFixed(0) + ' KB';
+  if (b < 1e9) return (b / 1024**2).toFixed(0) + ' MB';
+  return (b / GB).toFixed(2) + ' GB';
+}
+
+function fmtParams(p) {
+  if (p >= 1e9) return (p / 1e9).toFixed(2) + 'B';
+  if (p >= 1e6) return (p / 1e6).toFixed(1) + 'M';
+  if (p >= 1e3) return (p / 1e3).toFixed(0) + 'K';
+  return p.toString();
+}
+
+function render() {
+  const o = getOpts();
+  const r = calculate(o);
+
+  // Update derived UI
+  document.getElementById('loraRankOut').textContent = 'r = ' + o.loraRank;
+  document.getElementById('seqLengthOut').textContent = o.seqLength;
+  document.getElementById('batchSizeOut').textContent = o.batchSize;
+  document.getElementById('gradAccumOut').textContent =
+    Math.max(1, Math.round(8 / o.batchSize)) + ' (auto-derived to keep effective batch = 8)';
+  document.getElementById('trainableOut').textContent = fmtParams(r.trainableParams);
+
+  // Enable/disable LoRA group when full FT is selected
+  const loraDisabled = (o.trainMode === 'full');
+  document.getElementById('loraGroup').style.opacity = loraDisabled ? 0.4 : 1.0;
+  document.getElementById('loraRank').disabled = loraDisabled;
+  // paged_adamw_8bit only meaningful for LoRA scale; allow anyway
+
+  // Breakdown table
+  const tbody = document.querySelector('#breakdown tbody');
+  tbody.innerHTML = '';
+  const maxBytes = Math.max(...Object.values(r.components));
+  for (const [name, bytes] of Object.entries(r.components)) {
+    const tr = document.createElement('tr');
+    const pct = maxBytes > 0 ? (bytes / maxBytes) * 100 : 0;
+    tr.innerHTML = `
+      <td>${name}</td>
+      <td class="size">${fmtBytes(bytes)}</td>
+      <td><span class="bar" style="width:${pct}%"></span></td>
+    `;
+    tbody.appendChild(tr);
+  }
+
+  document.getElementById('totalMem').textContent = (r.total / GB).toFixed(2) + ' GB';
+
+  // GPU fit
+  const fitEl = document.getElementById('gpuFit');
+  fitEl.innerHTML = '';
+  const totalGB = r.total / GB;
+  for (const gpu of GPUS) {
+    const headroom = gpu.vramGB - totalGB;
+    const utilization = Math.min(100, (totalGB / gpu.vramGB) * 100);
+    let status, statusClass, fillColor;
+    if (headroom < 0) {
+      status = `OOM by ${(-headroom).toFixed(1)} GB`;
+      statusClass = 'nofit';
+      fillColor = 'var(--bad)';
+    } else if (headroom < 1.0) {
+      status = `⚠ tight: only ${headroom.toFixed(2)} GB free`;
+      statusClass = 'tight';
+      fillColor = 'var(--warn)';
+    } else {
+      status = `✓ fits, ${headroom.toFixed(1)} GB free`;
+      statusClass = 'fit';
+      fillColor = 'var(--good)';
+    }
+    const row = document.createElement('div');
+    row.className = 'gpu-row';
+    row.innerHTML = `
+      <span class="gpu-name">${gpu.name}</span>
+      <span class="gpu-bar"><span class="gpu-bar-fill" style="width:${utilization}%; background:${fillColor};"></span></span>
+      <span class="gpu-status ${statusClass}">${status}</span>
+    `;
+    fitEl.appendChild(row);
+  }
+}
+
+// Wire up listeners
+document.querySelectorAll('input').forEach(el => el.addEventListener('input', render));
+render();
+</script>
+
+</body>
+</html>

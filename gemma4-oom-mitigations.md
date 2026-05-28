@@ -1,74 +1,78 @@
-# Gemma 4 E4B memory budget (L4 default, T4 attempt history)
+# Gemma 4 E4B memory budget (A100 default; T4 and L4 attempt history)
 
-The notebook ([qlora_gemma4.ipynb](qlora_gemma4.ipynb)) targets **Colab L4 (24 GB VRAM, bf16-capable)** because the free **T4 (16 GB) cannot reliably fit Gemma 4 E4B for training**, even with every memory-saving lever applied. This doc covers:
+The notebook ([qlora_gemma4.ipynb](qlora_gemma4.ipynb)) targets **A100 (40 GB)** because both Colab T4 (16 GB) and Colab L4 (22 GB) **OOM for Gemma 4 E4B + LoRA training**, even with every memory-saving lever applied. This doc covers:
 
-1. Why T4 was abandoned (the hard limit).
-2. The L4 budget the notebook actually runs against (loose - we have ~10 GB of headroom).
-3. The full mitigation table - split into **always-on** (QLoRA core, applied everywhere) and **T4-only fallbacks** (currently NOT in the notebook; resurrect them if you must run on T4 + E2B).
+1. Why T4 and L4 were both abandoned (the hard limits, with empirical traces).
+2. The A100 budget the notebook actually runs against (loose - plenty of headroom).
+3. The full mitigation table - split into **always-on** (QLoRA core, applied everywhere) and **T4/L4-only fallbacks** (currently NOT in the notebook; resurrect them if you swap to E2B).
 4. Techniques deliberately NOT used (multi-GPU, alternative quantizations, etc.).
 
-## Why T4 was abandoned
+For an interactive what-fits-where calculator, see [gemma4-memory-calculator.html](gemma4-memory-calculator.html).
 
-T4 has 14.56 GB usable. Gemma 4 E4B's **static** footprint alone reaches ~10.5 GB on T4:
+## Why T4 and L4 were abandoned
+
+Two different walls. Both end at OOM but for **different dominant components**.
+
+### T4: PLE-dominated static footprint
+
+T4 has 14.56 GB usable. Gemma 4 E4B's static footprint alone reaches ~10.5 GB:
 
 | Component                                                 | Approx size | 4-bit-able? |
 | --------------------------------------------------------- | ----------- | ----------- |
 | 4.5B linear params (NF4 4-bit)                            | ~2.5 GB     | yes         |
 | ~3.5B PLE + 262k-vocab main embedding (fp16)              | ~7 GB       | **no** (`bnb` only quantizes `nn.Linear`, not `nn.Embedding`) |
-| LoRA adapter + grads + `paged_adamw_8bit` state (36.7M trainable) | ~0.4 GB | n/a |
+| LoRA adapter + grads + `paged_adamw_8bit` state           | ~0.4 GB     | n/a         |
 | CUDA / cuBLAS / bnb dequant scratch                       | ~2 GB       | n/a         |
 | **Static subtotal**                                       | **~10.5 GB** |             |
 
-That leaves ~4 GB on T4 for the **transient** demand during forward/backward:
+That leaves only ~4 GB for transient demand on T4 — not enough for the bnb dequant working tiles + activations + first-step optimizer alloc.
 
-- bnb 4-bit dequant working tiles (sequence-*independent* — `seq=512` does not help): up to ~200 MB peak per layer for Gemma 4's 2560×10240 MLP linears.
-- Activations (bs=1, seq=512, gradient-checkpointed): ~0.3-0.5 GB.
-- Gradients + cuBLAS workspaces + first-step optimizer alloc: ~0.5 GB.
-- PyTorch allocator fragmentation: 0.2-0.5 GB even with `expandable_segments`.
+### L4: bf16 cross-entropy logits-dominated transient
 
-Combined transient: ~1.5 GB minimum, ~3 GB peak. Adding to the 10.5 GB static, the peak load lands in the **13-13.5 GB range** — within rounding of the 14.56 GB cap. Allocator fragmentation, kernel JIT buffers, or any unrelated allocation tips it over. Repeated empirical attempts:
+L4 (Colab allocation is 22 GB, not always 24) has plenty of static room. The killer is the **cross-entropy loss computation** during the backward pass:
 
-| Attempt                                          | GPU class | Reserved before training | OOM during step  | Headroom at OOM |
-| ------------------------------------------------ | --------- | ------------------------ | ---------------- | --------------- |
-| bs=2, seq=2048, adamw_8bit                       | T4 16 GB  | -                        | step 0           | 0 (basically)   |
-| bs=1, seq=2048, adamw_8bit                       | T4 16 GB  | -                        | step 0           | ~2 MB free      |
-| bs=1, seq=1024, adamw_8bit                       | T4 16 GB  | -                        | step 0           | ~2 MB free      |
-| bs=1, seq=512, paged_adamw_8bit (most aggressive)| T4 16 GB  | 10.45 GB                 | step 0           | 27 MB free      |
-| bs=2, seq=2048, adamw_8bit, no `group_by_length` | L4 22 GB  | -                        | **step 9** (mid-training!) | 49 MB free      |
+- Cross-entropy needs the full logits tensor: `bs × seq × vocab × 2 bytes` (bf16) = `2 × 1024 × 262144 × 2 ≈ 1 GB` for one forward pass.
+- During backward, intermediates for `log_softmax`, the gradient w.r.t. logits, and the gradient w.r.t. embeddings all coexist briefly. Real peak is ~1.5-2 GB just for the loss + its backward.
+- This is **sequence-dependent** but `vocab`-dominated. Halving `seq` only halves this term; the 262k-vocab factor doesn't budge.
+- Length-sort doesn't help (the loss tensor size is determined by `max_seq_length`, not actual content length).
 
-Each T4 attempt shrank the activation column but ran into the unmovable bnb dequant + PLE static cost. **T4 simply has no margin for E4B + LoRA training.** The notebook now targets L4 instead.
+Combined with the ~10.5 GB static + activations + dequant + cuBLAS, L4 lands at ~22 GB peak — within rounding of its 22.03 GB cap.
 
-The L4 row in the table is the next part of the story: even L4 OOMed at the original `seq=2048` settings, but mid-training rather than at startup - because a single long-outlier batch (alpaca-cleaned has 1500+ token examples) pushed the worst-case activation past the 22 GB budget. Fixed by lowering `MAX_SEQ_LENGTH` to 1024 and adding `group_by_length=True` (see the L4 budget section below).
+### Empirical attempts
 
-If you must stay on T4: swap `model_name` in cell 4 to `unsloth/gemma-4-E2B-it` (E2B's PLE is ~3.5 GB vs E4B's ~7 GB), and you'll have ~3-4 GB of headroom back.
+| Attempt                                                            | GPU class | Reserved before training | OOM at step | Headroom at OOM | Dominant cause of failure                  |
+| ------------------------------------------------------------------ | --------- | ------------------------ | ----------- | --------------- | ------------------------------------------ |
+| bs=2, seq=2048, adamw_8bit                                         | T4 16 GB  | -                        | step 0      | 0 (basically)   | PLE static + activations                   |
+| bs=1, seq=2048, adamw_8bit                                         | T4 16 GB  | -                        | step 0      | ~2 MB free      | PLE static + dequant peak                  |
+| bs=1, seq=1024, adamw_8bit                                         | T4 16 GB  | -                        | step 0      | ~2 MB free      | PLE static + dequant peak                  |
+| bs=1, seq=512, paged_adamw_8bit (most aggressive)                  | T4 16 GB  | 10.45 GB                 | step 0      | 27 MB free      | PLE static + minimal activations           |
+| bs=2, seq=2048, adamw_8bit, **no length sort**                     | L4 22 GB  | -                        | **step 9** (mid-training) | 49 MB free      | unsorted long-outlier batch activation spike |
+| bs=2, seq=1024, adamw_8bit, **with length sort, all mitigations**  | L4 22 GB  | -                        | **step 2** (early)        | 63 MB free      | **bf16 cross-entropy logits over 262k vocab (522 MB transient)** - even shortest sorted batches hit this |
+| bs=2, seq=1024, adamw_8bit, with length sort                       | A100 40 GB| -                        | **completes** | ~17 GB free    | n/a - fits comfortably                     |
 
-## The L4 budget (what the notebook now runs against)
+**Conclusion:** T4 is unreachable for E4B without architecture-level intervention (would need to quantize the embeddings, which bnb doesn't support). L4 is closer but still loses to the loss-tensor transient peak; even chunked cross-entropy (`cut_cross_entropy`, if your Unsloth version exposes it) might bridge the gap, but stock SFTTrainer + Gemma 4 doesn't. **A100 40 GB is the smallest GPU class verified working** for E4B + LoRA on this notebook.
 
-Colab L4 instances vary - **observed allocation is 22-24 GB**, not always the full 24. The settings below assume 22 GB to be safe:
+If you must stay on L4 or T4: swap `model_name` in cell 4 to `unsloth/gemma-4-E2B-it`. E2B's PLE is ~3.5 GB (vs E4B's ~7 GB) and its vocab embedding factor is identical so the loss tensor is the same ~1 GB, but everything else shrinks — comfortable on L4, fits T4 with the T4-only fallbacks below.
 
-| Component                                              | Approx size on L4 |
-| ------------------------------------------------------ | ----------------- |
-| Static (4-bit weights + fp16 PLE + LoRA + workspaces) | ~10.5 GB          |
-| Activations (bs=2, seq=1024, checkpointed)            | ~1-2 GB           |
-| **Worst-case activation spike** on a long-outlier batch (alpaca has 1500+ token outliers) | up to +2-3 GB above the average | 
-| bnb dequant peak                                      | ~0.5-1 GB         |
-| Gradients + adamw_8bit + cuBLAS                       | ~0.5 GB           |
-| PyTorch allocator overhead                            | ~1-2 GB           |
-| **Average peak**                                      | **~14-16 GB**     |
-| **Worst-case peak** without `group_by_length`         | **~17-20 GB**     |
+## The A100 budget (what the notebook now runs against)
 
-**~4-8 GB of headroom** on a 22 GB L4 — comfortable for the average, but unlucky long-outlier batches can spike close to the cap. Two mitigations make this safe:
+A100 40 GB has 39.5 GB usable. The notebook's L4-era settings (bs=2, seq=1024, length-sort) leave generous headroom:
 
-- **`MAX_SEQ_LENGTH = 1024`** (not 2048): bounds the per-sample activation peak. Most alpaca examples fit; only long outliers truncate.
-- **`group_by_length = True`** in `TrainingArguments`: sorts samples by length so similar-length examples batch together. Memory peak becomes deterministic (you'd OOM at step 0 if at all, instead of mid-training), and padding waste drops.
+| Component                                              | Approx size on A100 |
+| ------------------------------------------------------ | ------------------- |
+| Static (4-bit weights + fp16 PLE + LoRA + workspaces) | ~10.5 GB            |
+| Activations (bs=2, seq=1024, checkpointed)            | ~1-2 GB             |
+| bnb dequant peak                                      | ~0.5-1 GB           |
+| **Cross-entropy logits (bs × seq × 262k × 2 bytes)**  | **~1-2 GB**         |
+| Gradients + adamw_8bit + cuBLAS                       | ~0.5 GB             |
+| PyTorch allocator overhead                            | ~1 GB               |
+| **Total peak**                                        | **~14-17 GB**       |
 
-Without `group_by_length` and with `seq=2048`, the notebook OOMed at step 9 on a 22 GB L4 — the static fit fine but an unlucky long-batch spike pushed peak past 22 GB. With both mitigations, expect comfortable training.
-
-On A100 (40 GB) or H100 (80 GB) you can raise to `seq=2048+` and `bs=4-8` and drop `group_by_length` if you want.
+**~22-25 GB of headroom** on A100 40 GB. You could comfortably go `bs=4, seq=2048` (would need ~25 GB peak) or `bs=8, seq=2048` on A100 80 GB / H100.
 
 ## Mitigations table
 
-Split into two categories:
+Split into two categories: what runs on A100 by default, and what you'd add on smaller hardware (with E2B).
 
 ### Always-on (QLoRA core - applied on every GPU class)
 
@@ -80,31 +84,33 @@ Split into two categories:
 | 4  | **`adamw_8bit` optimizer**                                         | cell 12 (`optim="adamw_8bit"`)          | ~220 MB on optimizer state      | minor numerical accuracy hit |
 | 5  | **`gc.collect() + torch.cuda.empty_cache()` before load**          | cell 4                                  | variable - reclaims leftover state from earlier failed loads | ~50-100 ms pause |
 | 6  | **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`**             | cell 4 (set BEFORE `import torch`)      | ~200-500 MB on allocator fragmentation | slightly different allocator behavior; rare edge cases with `torch.compile` |
-| 6a | **`MAX_SEQ_LENGTH = 1024`** (not 2048)                             | cell 4                                  | bounds the worst-case activation column at ~2× smaller than seq=2048 | examples >1024 tokens truncate - rare in alpaca-cleaned but real for long-output rows |
+| 6a | **`MAX_SEQ_LENGTH = 1024`** (not 2048)                             | cell 4                                  | ~half of activations and the bf16 loss tensor (~500 MB) vs seq=2048 | examples >1024 tokens truncate - rare in alpaca-cleaned but real for long-output rows. On A100 you can raise back to 2048 |
 | 6b | **Pre-sort dataset by length** (replacement for `group_by_length`) | cell 8 (`dataset.sort` after `dataset.map`) | up to ~3 GB on worst-case batches; converts unpredictable mid-training OOMs into a clean step-0 fit check | samples train in length order which can mildly bias gradient noise per step. Implemented as a manual sort because transformers 5.x removed `group_by_length` from `TrainingArguments`. |
 | 7  | **`finetune_vision_layers = False`** (text-only LoRA)              | cell 6                                  | ~100-200 MB on vision LoRA + grads + opt state | model can't be fine-tuned on image inputs without re-attaching vision LoRA |
 | 8  | **`device_map = {"": 0}`**                                         | cell 4                                  | 0 directly                      | pins all modules on GPU 0 - prevents the fp16 embedding from being silently CPU-offloaded (which causes a `cpu/cuda` device-mismatch at inference) |
 | 9  | **Model choice: E4B** (vs 26B-A4B / 31B)                           | cell 4 (`model_name`)                   | ~10+ GB vs the next size up     | smaller model, lower capability ceiling |
 | 10 | **`lora_dropout = 0, bias = "none"`**                              | cell 6                                  | <50 MB                          | less regularization; LoRA can't adapt biases. Mostly a speed knob, listed for completeness |
 
-### T4-only fallbacks (NOT in the L4 notebook; reach for these only on T4 + E2B)
+### T4/L4-only fallbacks (NOT in the A100 notebook; reach for these only with E2B on smaller GPUs)
 
 | #  | Measure                                          | Memory saved | Tradeoff                                                                                          |
 | -- | ------------------------------------------------ | ------------ | ------------------------------------------------------------------------------------------------- |
-| F1 | **`MAX_SEQ_LENGTH = 512`** (down from 2048)      | ~1-1.5 GB    | examples >512 tokens get truncated - a meaningful share of alpaca outputs are longer             |
-| F2 | **`per_device_train_batch_size = 1`** (down from 2) | ~0.5-1 GB | each optimizer step sees less data per device; wall-clock per epoch is slower                    |
+| F1 | **`MAX_SEQ_LENGTH = 512`** (down from 1024)      | ~500 MB on activations + ~500 MB on loss tensor | examples >512 tokens get truncated - a meaningful share of alpaca outputs are longer |
+| F2 | **`per_device_train_batch_size = 1`** (down from 2) | ~0.5-1 GB on activations + ~500 MB on loss tensor | each optimizer step sees less data per device; wall-clock per epoch is slower |
 | F3 | **`gradient_accumulation_steps = 8`** (up from 4) | 0 directly  | compensates for F2 to keep effective batch = 8; the price of F2, not a savings                  |
 | F4 | **`paged_adamw_8bit`** (vs `adamw_8bit`)         | ~150 MB      | ~10-15% wall-clock slowdown from CPU↔GPU paging traffic                                          |
+| F5 | **Swap model to E2B**                            | ~3.5 GB (PLE)| smaller model, lower capability ceiling. Required for reliable L4 fit; needed alongside F1-F4 on T4 |
+| F6 | **Enable `cut_cross_entropy`** (if Unsloth exposes it) | ~1 GB on bf16 loss tensor | chunks loss computation across vocab dim; speed impact minor. Might allow E4B on L4 directly - check your Unsloth version |
 
-Even with F1-F4 + E4B, T4 OOMs. F1-F4 fit only after also swapping the model to E2B.
+E4B fits A100 with **none of F1-F6**. E4B on L4 needs F6 (and maybe F1+F2); on T4 needs the full F1-F5. E2B fits L4 with no fallbacks and T4 with F1-F4.
 
-## If even L4 isn't enough (unlikely)
+## If even A100 isn't enough (unlikely)
 
 Quick escalation if you push E4B to long contexts or large batches:
 
 - **Drop to `unsloth/gemma-4-E2B-it`**: E2B's PLE is ~half the size (~3.5 GB instead of ~7 GB).
 - **Restrict LoRA to attention only** (`finetune_mlp_modules = False`): cuts trainable params and grads roughly in half (~18M instead of ~36M). Quality on instruction-following can suffer noticeably.
-- **Move to A100 (40 GB)**: undoes any need to compromise on batch / seq / optimizer.
+- **Move to A100 80 GB or H100**: undoes any need to compromise on batch / seq / optimizer; comfortably runs `bs=8, seq=4096`.
 
 ## Techniques deliberately NOT used (and why)
 
@@ -127,7 +133,7 @@ A reasonable practitioner will ask "what about ZeRO? FSDP? DDP? FA2?" These are 
 | Adapter method         | VeRA (Vector-based Random Matrix Adaptation)               | Smaller than LoRA but less mature; not in Unsloth's default path.                                                                                                           |
 | Adapter method         | LoftQ initialization                                       | Improves quantized model initialization quality, doesn't save memory. `loftq_config = None` is the standard choice.                                                         |
 | Adapter method         | LoRA-FA (frozen A matrix)                                  | Freezes the LoRA A matrix and only trains B - halves trainable params. Not standard in Unsloth and quality drop is usually noticeable.                                      |
-| Attention / activation | Flash Attention 2                                          | Not supported on Turing (T4 = sm_75); needs sm_80+ (Ampere). Available on L4 (Ada, sm_89) - Unsloth picks it up automatically.                                              |
+| Attention / activation | Flash Attention 2                                          | Not supported on Turing (T4 = sm_75); needs sm_80+ (Ampere). Available on L4 (Ada, sm_89) and A100 (sm_80) - Unsloth picks it up automatically there.                       |
 | Attention / activation | Selective / Megatron-style activation recomputation        | Finer-grained than Unsloth's gradient checkpointing; marginal improvement; not exposed by Unsloth.                                                                          |
 | Attention / activation | CPU activation offloading                                  | Trades CPU RAM + PCIe traffic for VRAM. Gradient checkpointing already saves 1-2 GB more cheaply, with no host-device traffic.                                              |
 
@@ -141,6 +147,8 @@ The memory estimates are derived from:
 - LoRA: `r × (in_features + out_features)` per targeted projection, ×2 bytes (fp16)
 - `adamw_8bit` state: ~6 bytes per trainable param (m + v at 8-bit + fp32 master)
 - Activations: linear in `batch × seq_len × hidden × num_layers`, divided by ~5-10× under Unsloth gradient checkpointing
+- **Cross-entropy logits: `batch × seq × vocab × 2 bytes` (bf16) - sequence-dependent but vocab-dominated; ~1 GB at bs=2, seq=1024, vocab=262144 (Gemma 4's vocab)**
 - CUDA/bnb overhead measured empirically from `torch.cuda.max_memory_reserved()` in cell 13 and the OOM error reports
+- T4 / L4 OOM data from the empirical attempts table above
 
 For a broader walk-through of what loads to GPU memory during a LoRA training run, see the analysis notes in [`/Users/ashishawasthi/.claude/plans/explain-what-all-gets-twinkling-turtle.md`](/Users/ashishawasthi/.claude/plans/explain-what-all-gets-twinkling-turtle.md) (this session's planning artifact).
