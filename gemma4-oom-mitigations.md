@@ -28,30 +28,43 @@ That leaves ~4 GB on T4 for the **transient** demand during forward/backward:
 
 Combined transient: ~1.5 GB minimum, ~3 GB peak. Adding to the 10.5 GB static, the peak load lands in the **13-13.5 GB range** — within rounding of the 14.56 GB cap. Allocator fragmentation, kernel JIT buffers, or any unrelated allocation tips it over. Repeated empirical attempts:
 
-| Attempt                                          | Reserved before training | OOM during step  | Headroom at OOM |
-| ------------------------------------------------ | ------------------------ | ---------------- | --------------- |
-| bs=2, seq=2048, adamw_8bit                       | -                        | yes              | 0 (basically)   |
-| bs=1, seq=2048, adamw_8bit                       | -                        | yes              | ~2 MB free      |
-| bs=1, seq=1024, adamw_8bit                       | -                        | yes              | ~2 MB free      |
-| bs=1, seq=512, paged_adamw_8bit (most aggressive) | 10.45 GB               | yes              | 27 MB free      |
+| Attempt                                          | GPU class | Reserved before training | OOM during step  | Headroom at OOM |
+| ------------------------------------------------ | --------- | ------------------------ | ---------------- | --------------- |
+| bs=2, seq=2048, adamw_8bit                       | T4 16 GB  | -                        | step 0           | 0 (basically)   |
+| bs=1, seq=2048, adamw_8bit                       | T4 16 GB  | -                        | step 0           | ~2 MB free      |
+| bs=1, seq=1024, adamw_8bit                       | T4 16 GB  | -                        | step 0           | ~2 MB free      |
+| bs=1, seq=512, paged_adamw_8bit (most aggressive)| T4 16 GB  | 10.45 GB                 | step 0           | 27 MB free      |
+| bs=2, seq=2048, adamw_8bit, no `group_by_length` | L4 22 GB  | -                        | **step 9** (mid-training!) | 49 MB free      |
 
-Each step shrank the activation column but ran into the unmovable bnb dequant + PLE static cost. **T4 simply has no margin for E4B + LoRA training.** The notebook now targets L4 instead.
+Each T4 attempt shrank the activation column but ran into the unmovable bnb dequant + PLE static cost. **T4 simply has no margin for E4B + LoRA training.** The notebook now targets L4 instead.
+
+The L4 row in the table is the next part of the story: even L4 OOMed at the original `seq=2048` settings, but mid-training rather than at startup - because a single long-outlier batch (alpaca-cleaned has 1500+ token examples) pushed the worst-case activation past the 22 GB budget. Fixed by lowering `MAX_SEQ_LENGTH` to 1024 and adding `group_by_length=True` (see the L4 budget section below).
 
 If you must stay on T4: swap `model_name` in cell 4 to `unsloth/gemma-4-E2B-it` (E2B's PLE is ~3.5 GB vs E4B's ~7 GB), and you'll have ~3-4 GB of headroom back.
 
 ## The L4 budget (what the notebook now runs against)
 
-L4 has 24 GB. Same static numbers as above plus the L4-baseline settings give:
+Colab L4 instances vary - **observed allocation is 22-24 GB**, not always the full 24. The settings below assume 22 GB to be safe:
 
 | Component                                              | Approx size on L4 |
 | ------------------------------------------------------ | ----------------- |
 | Static (4-bit weights + fp16 PLE + LoRA + workspaces) | ~10.5 GB          |
-| Activations (bs=2, seq=2048, checkpointed)            | ~1.5-2.5 GB       |
+| Activations (bs=2, seq=1024, checkpointed)            | ~1-2 GB           |
+| **Worst-case activation spike** on a long-outlier batch (alpaca has 1500+ token outliers) | up to +2-3 GB above the average | 
 | bnb dequant peak                                      | ~0.5-1 GB         |
 | Gradients + adamw_8bit + cuBLAS                       | ~0.5 GB           |
-| **Total peak**                                        | **~13-14 GB**     |
+| PyTorch allocator overhead                            | ~1-2 GB           |
+| **Average peak**                                      | **~14-16 GB**     |
+| **Worst-case peak** without `group_by_length`         | **~17-20 GB**     |
 
-**~10 GB of headroom** on L4. Could comfortably go `bs=4` or `seq=4096`. Code stays clean.
+**~4-8 GB of headroom** on a 22 GB L4 — comfortable for the average, but unlucky long-outlier batches can spike close to the cap. Two mitigations make this safe:
+
+- **`MAX_SEQ_LENGTH = 1024`** (not 2048): bounds the per-sample activation peak. Most alpaca examples fit; only long outliers truncate.
+- **`group_by_length = True`** in `TrainingArguments`: sorts samples by length so similar-length examples batch together. Memory peak becomes deterministic (you'd OOM at step 0 if at all, instead of mid-training), and padding waste drops.
+
+Without `group_by_length` and with `seq=2048`, the notebook OOMed at step 9 on a 22 GB L4 — the static fit fine but an unlucky long-batch spike pushed peak past 22 GB. With both mitigations, expect comfortable training.
+
+On A100 (40 GB) or H100 (80 GB) you can raise to `seq=2048+` and `bs=4-8` and drop `group_by_length` if you want.
 
 ## Mitigations table
 
@@ -67,6 +80,8 @@ Split into two categories:
 | 4  | **`adamw_8bit` optimizer**                                         | cell 12 (`optim="adamw_8bit"`)          | ~220 MB on optimizer state      | minor numerical accuracy hit |
 | 5  | **`gc.collect() + torch.cuda.empty_cache()` before load**          | cell 4                                  | variable - reclaims leftover state from earlier failed loads | ~50-100 ms pause |
 | 6  | **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`**             | cell 4 (set BEFORE `import torch`)      | ~200-500 MB on allocator fragmentation | slightly different allocator behavior; rare edge cases with `torch.compile` |
+| 6a | **`MAX_SEQ_LENGTH = 1024`** (not 2048)                             | cell 4                                  | bounds the worst-case activation column at ~2× smaller than seq=2048 | examples >1024 tokens truncate - rare in alpaca-cleaned but real for long-output rows |
+| 6b | **`group_by_length = True`**                                       | cell 12 (`TrainingArguments`)           | up to ~3 GB on worst-case batches; converts unpredictable mid-training OOMs into a clean step-0 fit check | only meaningful when `packing=False`; samples train in length order which can mildly bias gradient noise per step |
 | 7  | **`finetune_vision_layers = False`** (text-only LoRA)              | cell 6                                  | ~100-200 MB on vision LoRA + grads + opt state | model can't be fine-tuned on image inputs without re-attaching vision LoRA |
 | 8  | **`device_map = {"": 0}`**                                         | cell 4                                  | 0 directly                      | pins all modules on GPU 0 - prevents the fp16 embedding from being silently CPU-offloaded (which causes a `cpu/cuda` device-mismatch at inference) |
 | 9  | **Model choice: E4B** (vs 26B-A4B / 31B)                           | cell 4 (`model_name`)                   | ~10+ GB vs the next size up     | smaller model, lower capability ceiling |
