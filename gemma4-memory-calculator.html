@@ -255,7 +255,7 @@
     <h2>GPU fit</h2>
     <div class="panel">
       <div id="gpuFit"></div>
-      <p class="note">"Fits with X GB headroom" = the GPU has X GB free after peak load. <b>&lt;1 GB headroom is unsafe</b> &mdash; allocator fragmentation, variable-length spikes, or kernel JIT can tip it into OOM.</p>
+      <p class="note">"Fits with X GB headroom" = the GPU has X GB free after peak load. <b>&lt;5 GB headroom is flagged orange</b> &mdash; the calculator's estimate is an average peak; real runs see 1-3 GB additional spikes from variable-length batches, kernel JIT compilation, allocator fragmentation, and bnb dequant timing. Treat orange as "probably OOMs on first surprise"; green as "comfortable safety margin".</p>
     </div>
 
     <h2>Source &amp; assumptions</h2>
@@ -453,8 +453,8 @@ function render() {
       status = `OOM by ${(-headroom).toFixed(1)} GB`;
       statusClass = 'nofit';
       fillColor = 'var(--bad)';
-    } else if (headroom < 1.0) {
-      status = `⚠ tight: only ${headroom.toFixed(2)} GB free`;
+    } else if (headroom < 5.0) {
+      status = `⚠ tight: only ${headroom.toFixed(1)} GB free`;
       statusClass = 'tight';
       fillColor = 'var(--warn)';
     } else {
